@@ -384,7 +384,7 @@ def transfer_to_terabox(share_url: str, target_folder: str = None) -> dict:
     # Get jsToken
     jstoken = get_jstoken(working_domain)
     if not jstoken:
-        for fallback_dom in ["https://www.1024terabox.com", "https://www.terabox.com"]:
+        for fallback_dom in ["https://www.terabox.app", "https://www.1024terabox.com", "https://www.terabox.com"]:
             jstoken = get_jstoken(fallback_dom)
             if jstoken:
                 break
@@ -731,10 +731,10 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
             )
         }
 
-    # Get jsToken from the working domain (or www.1024terabox.com as fallback)
+    # Get jsToken from the working domain (or fallback domains)
     jstoken = get_jstoken(working_domain)
     if not jstoken:
-        for fallback_dom in ["https://www.1024terabox.com", "https://www.terabox.com"]:
+        for fallback_dom in ["https://www.terabox.app", "https://www.1024terabox.com", "https://www.terabox.com"]:
             jstoken = get_jstoken(fallback_dom)
             if jstoken:
                 break
@@ -759,24 +759,40 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
         "block_list": block_list_json,
     }
 
-    try:
-        p_resp = upload_scraper.post(
-            f"{working_domain}/api/precreate",
-            params=params,
-            data=precreate_data,
-            headers=api_hdrs,
-            timeout=20
-        )
-        p_data = p_resp.json()
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"❌ <b>Precreate failed:</b> {str(e)[:80]}\n💡 Update cookie via /setcookie"
-        }
+    # Try precreate — if errno=4000023, refresh jsToken and retry (AList pattern)
+    p_data = None
+    for attempt in range(2):
+        try:
+            p_resp = upload_scraper.post(
+                f"{working_domain}/api/precreate",
+                params=params,
+                data=precreate_data,
+                headers=api_hdrs,
+                timeout=20
+            )
+            p_data = p_resp.json()
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"❌ <b>Precreate failed:</b> {str(e)[:80]}\n💡 Update cookie via /setcookie"
+            }
 
-    p_errno = p_data.get("errno", -1)
-    uploadid = p_data.get("uploadid", "")
-    logger.info(f"precreate {working_domain}: errno={p_errno}, uploadid={uploadid[:20] if uploadid else 'none'}, full={json.dumps(p_data)[:200]}")
+        p_errno = p_data.get("errno", -1)
+        uploadid = p_data.get("uploadid", "")
+        logger.info(f"precreate {working_domain} (attempt {attempt+1}): errno={p_errno}, uploadid={uploadid[:20] if uploadid else 'none'}")
+
+        if p_errno == 4000023 and attempt == 0:
+            # jsToken stale — refresh and retry (AList handles 4000023 the same way)
+            logger.info("errno=4000023: refreshing jsToken and retrying precreate...")
+            jstoken = get_jstoken(working_domain)
+            if not jstoken:
+                for fb in ["https://www.terabox.app", "https://www.1024terabox.com"]:
+                    jstoken = get_jstoken(fb)
+                    if jstoken:
+                        break
+            params = _make_api_params(jstoken)
+            continue
+        break
 
     if p_errno != 0 or not uploadid:
         return {
@@ -801,11 +817,13 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
     }
 
     # PCS upload candidates — ordered by likelihood of success
-    # c-jp.terabox.com is what AList uses (url_domain_prefix = "jp")
+    # c-jp.terabox.com/app is what AList uses (url_domain_prefix = "jp")
     pcs_candidates = [
+        "https://c-jp.terabox.app",
         "https://c-jp.terabox.com",
         "https://c-jp.1024terabox.com",
         working_domain,
+        "https://data.terabox.app",
         "https://data.1024terabox.com",
         "https://data.terabox.com",
     ]
