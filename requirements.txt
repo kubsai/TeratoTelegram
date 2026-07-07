@@ -1,0 +1,11 @@
+python-telegram-bot
+python-dotenv
+requests
+cloudscraper
+qrcode
+Pillow
+Flask
+gunicorn
+mysql-connector-python
+PyMySQL
+Werkzeug
