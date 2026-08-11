@@ -29,6 +29,7 @@ from terabox_helper import (
     set_active_proxy,
     rotate_proxy,
     fetch_fresh_proxies,
+    login_with_browser_sandbox,
 )
 
 load_dotenv()
@@ -51,6 +52,219 @@ admin_audit_log = []  # [{"timestamp": str, "user_id": int, "action": str, "resu
 MAX_AUDIT_LOG = 500
 SERVER_START_TIME = time.time()
 DB_STATUS = {"connected": False, "error": None, "driver": None, "checked_at": None}  # Startup DB check result
+
+# ===================== AUTHENTICATION & COOKIE MANAGEMENT =====================
+
+COOKIE_HEALTH = {
+    "valid": True,
+    "last_check": None,
+    "message": "Not checked yet"
+}
+
+
+def save_auth_cookies(raw_or_dict):
+    """
+    Universal Session & Cookie Updater:
+    Parses single ndus values, multi-cookie strings, or dicts,
+    updates environment variables, persists to DB (bot_settings) & settings.json,
+    and syncs active CloudScraper session cookie jars.
+    """
+    from terabox_helper import update_cookie
+    from database import save_setting
+
+    parsed = {}
+    if isinstance(raw_or_dict, str):
+        raw_str = raw_or_dict.strip()
+        if ";" in raw_str and "=" in raw_str:
+            for part in raw_str.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    parsed[k.strip()] = v.strip()
+        else:
+            parsed["ndus"] = raw_str
+    elif isinstance(raw_or_dict, dict):
+        parsed = raw_or_dict
+
+    mapping = {
+        "ndus": "TERABOX_NDUS_COOKIE",
+        "browserid": "TERABOX_BROWSERID",
+        "csrftoken": "TERABOX_CSRFTOKEN",
+        "ndut_fmt": "TERABOX_NDUT_FMT",
+        "ndut_fmv": "TERABOX_NDUT_FMV",
+        "lang": "TERABOX_LANG",
+    }
+
+    updated_vars = []
+    for cookie_key, env_var in mapping.items():
+        val = None
+        for p_k, p_v in parsed.items():
+            if p_k.lower() == cookie_key.lower():
+                val = p_v
+                break
+        if val:
+            os.environ[env_var] = val
+            save_setting(env_var, val)
+            updated_vars.append(cookie_key)
+
+    main_ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
+    if main_ndus:
+        update_cookie(main_ndus)
+        save_ndus_to_db(main_ndus)
+
+    add_log(f"Session cookies updated: {', '.join(updated_vars) if updated_vars else 'ndus'}")
+    return updated_vars
+
+
+def load_saved_auth_cookies():
+    """Load saved authentication cookies from DB / settings.json on startup."""
+    from database import get_setting
+    from terabox_helper import update_cookie
+
+    mapping = [
+        "TERABOX_NDUS_COOKIE",
+        "TERABOX_BROWSERID",
+        "TERABOX_CSRFTOKEN",
+        "TERABOX_NDUT_FMT",
+        "TERABOX_NDUT_FMV",
+        "TERABOX_LANG",
+    ]
+
+    loaded_count = 0
+    for env_var in mapping:
+        val = get_setting(env_var, "")
+        if val:
+            os.environ[env_var] = val
+            loaded_count += 1
+
+    main_ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
+    if main_ndus:
+        update_cookie(main_ndus)
+
+    if loaded_count > 0:
+        logger.info(f"✅ Auto-restored {loaded_count} auth cookie parameters from persistent storage.")
+    return loaded_count
+
+
+def run_cookie_health_checker():
+    """Background thread monitoring TeraBox cookie validity every 30 minutes."""
+    global COOKIE_HEALTH
+    while True:
+        try:
+            ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
+            if ndus:
+                from terabox_helper import check_terabox_connectivity
+                res = check_terabox_connectivity(ndus)
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if res.get("success"):
+                    COOKIE_HEALTH = {
+                        "valid": True,
+                        "last_check": now_str,
+                        "message": res.get("message", "Cookie Valid")
+                    }
+                else:
+                    previous_valid = COOKIE_HEALTH.get("valid", True)
+                    COOKIE_HEALTH = {
+                        "valid": False,
+                        "last_check": now_str,
+                        "message": res.get("message", "Cookie Expired")
+                    }
+                    if previous_valid:
+                        add_log("⚠️ ALERT: TeraBox Cookie Expired!")
+                        logger.warning("⚠️ ALERT: TeraBox Cookie Expired!")
+                        try:
+                            import urllib.request
+                            import urllib.parse
+                            bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                            if bot_token:
+                                for uid, sdata in list(admin_sessions.items()):
+                                    chat_id = sdata.get("chat_id") or uid
+                                    alert_txt = (
+                                        "⚠️ <b>ATTENTION: TeraBox Cookie Expired!</b>\n\n"
+                                        "Your TeraBox session cookie has expired or been invalidated by TeraBox.\n\n"
+                                        "<b>Options to re-authenticate:</b>\n"
+                                        "1. Use <code>/login</code> to scan QR Code with Mobile App\n"
+                                        "2. Use <code>/setcookie &lt;new_ndus&gt;</code> to update manually\n"
+                                        "3. Open Web Dashboard to paste new cookie string."
+                                    )
+                                    msg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                                    data = urllib.parse.urlencode({"chat_id": chat_id, "text": alert_txt, "parse_mode": "HTML"}).encode()
+                                    req = urllib.request.Request(msg_url, data=data)
+                                    urllib.request.urlopen(req, timeout=5)
+                        except Exception as e:
+                            logger.error(f"Failed sending cookie alert: {e}")
+        except Exception as e:
+            logger.error(f"Health checker error: {e}")
+
+        time.sleep(1800)  # Check every 30 mins
+
+# ===================== URL ONLY MODE CONFIG =====================
+
+url_only_mode_state = {
+    "active": False,
+    "expires_at": 0.0,
+    "activated_at": 0.0,
+}
+
+
+def set_url_only_mode(enabled: bool, duration_seconds: int = 3600):
+    global url_only_mode_state
+    now = time.time()
+    if enabled:
+        exp = now + duration_seconds
+        url_only_mode_state = {
+            "active": True,
+            "expires_at": exp,
+            "activated_at": now,
+        }
+        try:
+            from database import save_setting
+            save_setting("url_mode_expires_at", str(exp))
+            save_setting("url_mode_activated_at", str(now))
+        except Exception as e:
+            logger.warning(f"Could not persist url_mode state: {e}")
+    else:
+        url_only_mode_state = {
+            "active": False,
+            "expires_at": 0.0,
+            "activated_at": 0.0,
+        }
+        try:
+            from database import save_setting
+            save_setting("url_mode_expires_at", "0")
+        except Exception as e:
+            logger.warning(f"Could not persist url_mode state: {e}")
+
+
+def get_url_only_mode_status() -> tuple[bool, float]:
+    global url_only_mode_state
+    now = time.time()
+    if url_only_mode_state.get("active"):
+        exp = url_only_mode_state.get("expires_at", 0.0)
+        if now < exp:
+            return True, exp - now
+        else:
+            url_only_mode_state["active"] = False
+            return False, 0.0
+
+    try:
+        from database import get_setting
+        exp_str = get_setting("url_mode_expires_at", "0")
+        act_str = get_setting("url_mode_activated_at", "0")
+        if exp_str and exp_str != "0":
+            exp_val = float(exp_str)
+            act_val = float(act_str) if act_str != "0" else now
+            if now < exp_val:
+                url_only_mode_state = {
+                    "active": True,
+                    "expires_at": exp_val,
+                    "activated_at": act_val,
+                }
+                return True, exp_val - now
+    except Exception as e:
+        logger.debug(f"Failed loading url_mode setting: {e}")
+
+    return False, 0.0
 
 
 def add_log(msg):
@@ -109,6 +323,7 @@ def _try_mysql_connector(config):
 def _try_pymysql(config):
     """Try connecting with PyMySQL (fallback driver)."""
     import pymysql
+    import pymysql.cursors
     conn = pymysql.connect(
         host=config["host"],
         user=config["user"],
@@ -427,41 +642,65 @@ COOKIE_COLLECTOR_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Cookie Collector</title>
+    <title>TeraBox Cookie Collector & QR Login</title>
     <style>
         body { font-family: system-ui; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: auto; }
+        .container { max-width: 850px; margin: auto; }
         .card { background: #1e2937; padding: 24px; border-radius: 12px; margin-bottom: 20px; }
         h1 { color: #60a5fa; }
         textarea { width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #475569;
-                   border-radius: 8px; padding: 12px; box-sizing: border-box; }
+                   border-radius: 8px; padding: 12px; box-sizing: border-box; font-family: monospace; }
         button { background: #3b82f6; color: white; padding: 10px 20px; border: none;
-                 border-radius: 6px; cursor: pointer; font-size: 15px; }
+                 border-radius: 6px; cursor: pointer; font-size: 15px; margin-right: 8px; }
         button:hover { background: #2563eb; }
         .back { color: #60a5fa; text-decoration: none; }
-        .success { color: #4ade80; background: #052e16; padding: 10px; border-radius: 6px; display:none; }
-        .error-msg { color: #f87171; background: #450a0a; padding: 10px; border-radius: 6px; display:none; }
+        .success { color: #4ade80; background: #052e16; padding: 12px; border-radius: 6px; display:none; }
+        .error-msg { color: #f87171; background: #450a0a; padding: 12px; border-radius: 6px; display:none; }
+        .qr-box { text-align: center; background: #0f172a; padding: 20px; border-radius: 8px; margin-top: 15px; display:none; }
+        .qr-box img { max-width: 200px; border-radius: 8px; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>🍪 Cookie Collector</h1>
+    <h1>🍪 Cookie Collector & QR Login</h1>
     <p><a href="/" class="back">← Back to Dashboard</a></p>
 
     <div class="card">
-        <h3>Paste Your ndus Cookie</h3>
-        <p>Open TeraBox in your browser, open DevTools → Application → Cookies and copy the <code>ndus</code> value.</p>
-        <textarea id="ndusInput" rows="4" placeholder="Paste ndus cookie value here..."></textarea>
+        <h3>Method 1: Scan QR Code (Mobile App)</h3>
+        <p>Generate a QR code and scan it with your TeraBox Mobile App (Settings → Scan QR Code).</p>
+        <button onclick="startQRLogin()">📱 Generate Login QR Code</button>
+        <div id="qrBox" class="qr-box">
+            <p style="color:#60a5fa; font-weight:bold;">Scan with TeraBox App:</p>
+            <div id="qrContainer"></div>
+            <p id="qrStatus" style="color:#94a3b8; font-size:14px; margin-top:10px;">Waiting for scan...</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>Method 2: Paste Cookie Header / ndus String</h3>
+        <p>Paste single <code>ndus</code> value OR your full <code>Cookie: ...</code> header string from DevTools (F12 → Network/Application → Cookies).</p>
+        <textarea id="ndusInput" rows="4" placeholder="Paste ndus=YQNP... or full Cookie string here..."></textarea>
         <br><br>
-        <button onclick="saveCookie()">💾 Save Cookie</button>
-        <div id="successMsg" class="success" style="margin-top:12px;">✅ Cookie saved successfully!</div>
-        <div id="errorMsg" class="error-msg" style="margin-top:12px;">❌ Failed to save cookie. Please try again.</div>
+        <button onclick="saveCookie()">💾 Save & Sync Session</button>
+        <div id="successMsg" class="success" style="margin-top:12px;"></div>
+        <div id="errorMsg" class="error-msg" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+        <h3>Method 3: Browser Sandbox Auto-Login (Credentials)</h3>
+        <p>Enter your TeraBox account username/email and password to launch the server browser sandbox login engine.</p>
+        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
+            <input type="text" id="autoUser" placeholder="TeraBox Username / Email" style="flex:1; min-width:200px; padding:10px; background:#0f172a; border:1px solid #475569; color:#e2e8f0; border-radius:6px;">
+            <input type="password" id="autoPass" placeholder="TeraBox Password" style="flex:1; min-width:200px; padding:10px; background:#0f172a; border:1px solid #475569; color:#e2e8f0; border-radius:6px;">
+        </div>
+        <button onclick="startBrowserLogin()">🤖 Auto-Login & Extract Session Cookies</button>
+        <div id="autoStatus" class="success" style="margin-top:12px;"></div>
     </div>
 </div>
 <script>
 function saveCookie() {
     const ndus = document.getElementById('ndusInput').value.trim();
-    if (!ndus) { alert('Please enter an ndus value.'); return; }
+    if (!ndus) { alert('Please enter cookie value.'); return; }
     fetch('/save-ndus', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -470,15 +709,104 @@ function saveCookie() {
     .then(r => r.json())
     .then(data => {
         if (data.success) {
-            document.getElementById('successMsg').style.display = 'block';
+            const sMsg = document.getElementById('successMsg');
+            sMsg.style.display = 'block';
+            sMsg.innerHTML = '✅ Cookie saved and synced successfully! Parameters: ' + (data.updated ? data.updated.join(', ') : 'ndus');
             document.getElementById('errorMsg').style.display = 'none';
         } else {
-            document.getElementById('errorMsg').style.display = 'block';
+            const eMsg = document.getElementById('errorMsg');
+            eMsg.style.display = 'block';
+            eMsg.innerText = '❌ ' + (data.message || 'Failed to save cookie.');
             document.getElementById('successMsg').style.display = 'none';
         }
     })
     .catch(() => {
         document.getElementById('errorMsg').style.display = 'block';
+        document.getElementById('errorMsg').innerText = '❌ Request error saving cookie.';
+    });
+}
+
+function startBrowserLogin() {
+    const u = document.getElementById('autoUser').value.trim();
+    const p = document.getElementById('autoPass').value.trim();
+    const st = document.getElementById('autoStatus');
+    if (!u || !p) { alert('Please enter both username and password.'); return; }
+
+    st.style.display = 'block';
+    st.className = 'success';
+    st.style.background = '#1e3a8a';
+    st.style.color = '#93c5fd';
+    st.innerHTML = '⏳ <b>Launching Browser Sandbox Engine...</b> Logging in to TeraBox servers...';
+
+    fetch('/api/browser-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            st.className = 'success';
+            st.style.background = '#052e16';
+            st.style.color = '#4ade80';
+            st.innerHTML = '🎉 <b>Browser Login Successful!</b> Engine: ' + (data.method || 'Browser Worker') + '<br>Saved cookies: ' + (data.updated ? data.updated.join(', ') : 'ndus');
+        } else {
+            st.className = 'error-msg';
+            st.style.display = 'block';
+            st.innerHTML = '❌ ' + (data.error || 'Browser login failed.');
+        }
+    })
+    .catch(() => {
+        st.className = 'error-msg';
+        st.style.display = 'block';
+        st.innerText = '❌ Request error executing browser sandbox worker.';
+    });
+}
+
+let pollTimer = null;
+function startQRLogin() {
+    const qrBox = document.getElementById('qrBox');
+    const qrContainer = document.getElementById('qrContainer');
+    const qrStatus = document.getElementById('qrStatus');
+    qrBox.style.display = 'block';
+    qrStatus.innerText = '⏳ Fetching QR Code from TeraBox...';
+    qrContainer.innerHTML = '';
+
+    if (pollTimer) clearInterval(pollTimer);
+
+    fetch('/api/qr/get')
+    .then(r => r.json())
+    .then(data => {
+        if (data.success && data.url && data.sign) {
+            qrContainer.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.url) + '" alt="QR Code">';
+            qrStatus.innerHTML = '⏳ <b>Scan this QR code with TeraBox Mobile App!</b><br>Polling server...';
+            const sign = data.sign;
+
+            let polls = 0;
+            pollTimer = setInterval(() => {
+                polls++;
+                if (polls > 60) {
+                    clearInterval(pollTimer);
+                    qrStatus.innerText = '⚠️ QR Code expired. Please generate a new one.';
+                    return;
+                }
+                fetch('/api/qr/poll?sign=' + encodeURIComponent(sign))
+                .then(r => r.json())
+                .then(pdata => {
+                    if (pdata.status === 'confirmed') {
+                        clearInterval(pollTimer);
+                        qrStatus.innerHTML = '🎉 <b>QR Login Successful!</b> Cookie saved and synced.';
+                    } else if (pdata.status === 'scanned') {
+                        qrStatus.innerHTML = '📱 <b>QR Code Scanned!</b> Confirm login on your phone...';
+                    } else if (pdata.status === 'expired') {
+                        clearInterval(pollTimer);
+                        qrStatus.innerHTML = '⚠️ QR Code expired.';
+                    }
+                });
+            }, 2500);
+        } else {
+            qrStatus.innerText = '❌ ' + (data.error || 'Could not fetch QR code.');
+        }
     });
 }
 </script>
@@ -559,15 +887,58 @@ def cookie_collector():
 @app.route("/save-ndus", methods=["POST"])
 def save_ndus():
     if not session.get("logged_in"):
-        return jsonify({"success": False})
-    data = request.get_json()
-    ndus_value = data.get("ndus", "").strip()
-    if ndus_value:
-        os.environ["TERABOX_NDUS_COOKIE"] = ndus_value
-        save_ndus_to_db(ndus_value)
-        add_log("ndus cookie saved via Cookie Collector")
-        return jsonify({"success": True})
-    return jsonify({"success": False})
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    data = request.get_json() or {}
+    cookie_value = data.get("ndus", "").strip() or data.get("cookie", "").strip()
+    if cookie_value:
+        updated = save_auth_cookies(cookie_value)
+        return jsonify({"success": True, "updated": updated})
+    return jsonify({"success": False, "message": "No cookie value provided"})
+
+
+@app.route("/api/qr/get")
+def api_qr_get():
+    if not session.get("logged_in"):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    from terabox_helper import get_qr_login_data
+    data = get_qr_login_data()
+    return jsonify(data)
+
+
+@app.route("/api/qr/poll")
+def api_qr_poll():
+    if not session.get("logged_in"):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    sign = request.args.get("sign", "").strip()
+    if not sign:
+        return jsonify({"status": "error", "message": "Missing sign parameter"})
+    from terabox_helper import poll_qr_login
+    res = poll_qr_login(sign)
+    if res.get("status") == "confirmed":
+        ndus_val = res.get("ndus", "")
+        if ndus_val:
+            save_auth_cookies(ndus_val)
+    return jsonify(res)
+
+
+@app.route("/api/browser-login", methods=["POST"])
+def api_browser_login():
+    if not session.get("logged_in"):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    data = request.get_json() or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    if not username or not password:
+        return jsonify({"success": False, "message": "Username and password required"})
+
+    from terabox_helper import login_with_browser_sandbox
+    res = login_with_browser_sandbox(username, password)
+    if res.get("success") and res.get("cookies"):
+        updated = save_auth_cookies(res["cookies"])
+        add_log(f"Browser Sandbox auto-login successful for {username[:4]}*** via {res.get('method')}")
+        return jsonify({"success": True, "method": res.get("method"), "updated": updated})
+
+    return jsonify({"success": False, "error": res.get("error", "Auto-login failed")})
 
 
 # ===================== API ENDPOINT =====================
@@ -577,18 +948,16 @@ API_KEY = os.getenv("API_KEY", "default_secret_key_12345").strip()  # .strip() t
 
 @app.route("/api/save-cookie", methods=["POST"])
 def api_save_cookie():
-    data = request.get_json()
+    data = request.get_json() or {}
     if not data or data.get("api_key") != API_KEY:
         return jsonify({"success": False, "message": "Invalid API key"}), 401
 
-    ndus_value = data.get("ndus", "").strip()
-    if ndus_value:
-        os.environ["TERABOX_NDUS_COOKIE"] = ndus_value
-        save_ndus_to_db(ndus_value)
-        add_log("ndus cookie received via API")
-        return jsonify({"success": True})
+    cookie_value = data.get("ndus", "").strip() or data.get("cookie", "").strip()
+    if cookie_value:
+        updated = save_auth_cookies(cookie_value)
+        return jsonify({"success": True, "updated": updated})
 
-    return jsonify({"success": False, "message": "No ndus provided"})
+    return jsonify({"success": False, "message": "No cookie provided"})
 
 
 @app.route("/health")
@@ -715,6 +1084,8 @@ def run_telegram_bot():
         # ─── /start Command ───
 
         async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message:
+                return
             await update.message.reply_text(
                 "🚀 <b>Welcome to TeraBox Manager!</b>\n\n"
                 "Use /help to see available commands.\n\n"
@@ -725,6 +1096,8 @@ def run_telegram_bot():
         # ─── /help Command (context-aware) ───
 
         async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message or not update.effective_user:
+                return
             user_id = update.effective_user.id
             is_admin = is_admin_session_valid(user_id)
 
@@ -732,12 +1105,15 @@ def run_telegram_bot():
                 "📋 <b>Available Commands</b>\n\n"
                 "  /start — Welcome message\n"
                 "  /help — Show this help\n"
-                "  /status — Check TeraBox connection\n"
+                "  /status — Check TeraBox connection & mode status\n"
+                "  /urlmode [on|off|status] — Enable 60-min URL Only Mode\n"
+                "  /stopurlmode — Deactivate URL Only Mode\n"
                 "  /folders [path] — List TeraBox folders\n"
                 "  /upload — Direct file upload info\n"
                 "  /setfolder &lt;path&gt; — Change target folder\n"
                 "  /setcookie &lt;value&gt; — Update cookie\n"
-                "  /login — QR Code / login options\n"
+                "  /autologin &lt;user&gt; &lt;pass&gt; — Auto browser sandbox login\n"
+                "  /login — Login methods menu\n"
                 "  /admin — Admin authentication\n\n"
                 "💡 <i>Send any file (document, video, photo) or TeraBox share link to save to your cloud!</i>\n"
             )
@@ -810,11 +1186,20 @@ def run_telegram_bot():
             if csrftoken:
                 extra_cookies.append("csrfToken ✅")
 
+            url_active, time_left = get_url_only_mode_status()
+            if url_active:
+                m = int(time_left // 60)
+                s = int(time_left % 60)
+                url_mode_line = f"🟢 Active ({m}m {s}s remaining)"
+            else:
+                url_mode_line = "⚫ Inactive"
+
             msg = (
                 "📊 <b>System Status</b>\n\n"
                 f"<b>TeraBox:</b> {tera_status}\n"
                 f"<b>API Domain:</b> <code>{TERABOX_BASE_URL}</code>\n"
                 f"<b>Telegram Bot:</b> {bot_status}\n"
+                f"<b>URL Only Mode:</b> {url_mode_line}\n"
                 f"<b>ndus Cookie:</b> {len(ndus)} chars ({mask_sensitive(ndus, 4)})\n"
                 f"<b>Extra Cookies:</b> {', '.join(extra_cookies)}\n"
                 f"<b>Target Folder:</b> {current_target_folder}\n"
@@ -825,12 +1210,16 @@ def run_telegram_bot():
         # ─── /folders Command ───
 
         async def folders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message:
+                return
             ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
             if not ndus:
                 await update.message.reply_text("❌ No ndus cookie set. Use /setcookie to set one.")
                 return
 
-            path = context.args[0] if context.args else "/"
+            raw_path = context.args[0] if context.args else "/"
+            path = raw_path if raw_path.startswith("/") else "/" + raw_path
+
             await update.message.reply_text(f"📂 Loading folders in <code>{path}</code>...", parse_mode="HTML")
 
             result = list_terabox_folders(ndus, path)
@@ -893,11 +1282,12 @@ def run_telegram_bot():
                 parse_mode="HTML",
             )
 
-        # ─── /login Command (QR Code + Cookie Options) ───
+        # ─── /login Command (QR Code + Auto-Login + Cookie Options) ───
 
         async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [
-                [InlineKeyboardButton("📱 Scan QR Code (Mobile Friendly)", callback_data="login_qr")],
+                [InlineKeyboardButton("📱 Scan QR Code (Mobile App)", callback_data="login_qr")],
+                [InlineKeyboardButton("🤖 Auto-Login with Credentials", callback_data="login_auto_info")],
                 [InlineKeyboardButton("🍪 Set Cookie Manually", callback_data="login_manual_info")],
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -905,16 +1295,17 @@ def run_telegram_bot():
                 "🔐 <b>TeraBox Login Methods</b>\n\n"
                 "Choose your preferred login method:\n\n"
                 "1️⃣ <b>QR Code Scan (Recommended for Mobile)</b>:\n"
-                "   • Generates a QR Code\n"
-                "   • Open TeraBox mobile app → Settings → Scan QR\n"
-                "   • Server captures your session automatically!\n\n"
-                "2️⃣ <b>Set Cookie Manually</b>:\n"
-                "   • Use <code>/setcookie &lt;ndus_value&gt;</code>",
+                "   • Generates a QR Code to scan with TeraBox mobile app\n\n"
+                "2️⃣ <b>Auto-Login with Credentials</b>:\n"
+                "   • Use <code>/autologin &lt;username&gt; &lt;password&gt;</code>\n"
+                "   • Launches server browser sandbox to log in automatically!\n\n"
+                "3️⃣ <b>Set Cookie Manually</b>:\n"
+                "   • Use <code>/setcookie &lt;ndus_or_cookie_string&gt;</code>",
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
 
-        # ─── /setcookie Command (Smart Cookie Parser) ───
+        # ─── /setcookie Command (Smart Cookie Parser & Storage Persister) ───
 
         async def setcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not context.args:
@@ -926,40 +1317,64 @@ def run_telegram_bot():
                 return
 
             raw_input = " ".join(context.args).strip()
-
-            # Parse multi-cookie strings (e.g. key1=val1; key2=val2)
-            if ";" in raw_input and "=" in raw_input:
-                for part in raw_input.split(";"):
-                    part = part.strip()
-                    if "=" in part:
-                        k, v = part.split("=", 1)
-                        k_upper = k.strip().upper()
-                        v_val = v.strip()
-                        if k_upper == "NDUS":
-                            os.environ["TERABOX_NDUS_COOKIE"] = v_val
-                        elif k_upper == "BROWSERID":
-                            os.environ["TERABOX_BROWSERID"] = v_val
-                        elif k_upper == "CSRFTOKEN":
-                            os.environ["TERABOX_CSRFTOKEN"] = v_val
-                        elif k_upper == "NDUT_FMT":
-                            os.environ["TERABOX_NDUT_FMT"] = v_val
-                        elif k_upper == "NDUT_FMV":
-                            os.environ["TERABOX_NDUT_FMV"] = v_val
-
-                new_cookie = os.getenv("TERABOX_NDUS_COOKIE", raw_input)
-            else:
-                new_cookie = raw_input
-                os.environ["TERABOX_NDUS_COOKIE"] = new_cookie
-
-            update_cookie(new_cookie)
-            save_ndus_to_db(new_cookie)
-            add_log("Cookie updated via Telegram /setcookie")
+            updated_vars = save_auth_cookies(raw_input)
+            ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
 
             await update.message.reply_text(
-                f"✅ <b>Cookie updated successfully!</b>\n"
-                f"<b>ndus Preview:</b> <code>{mask_sensitive(new_cookie, 4)}</code>",
+                f"✅ <b>Authentication Cookies Saved & Persisted!</b>\n\n"
+                f"<b>Updated parameters:</b> <code>{', '.join(updated_vars) if updated_vars else 'ndus'}</code>\n"
+                f"<b>ndus Preview:</b> <code>{mask_sensitive(ndus, 4)}</code>\n\n"
+                f"<i>Saved to database & settings storage for auto-restore on restarts.</i>",
                 parse_mode="HTML",
             )
+
+        # ─── /autologin Command (Browser Sandbox Login Worker) ───
+
+        async def autologin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message:
+                return
+            args = context.args or []
+            if len(args) < 2:
+                await update.message.reply_text(
+                    "🤖 <b>Browser Sandbox Auto-Login</b>\n\n"
+                    "<b>Usage:</b> <code>/autologin &lt;username_or_email&gt; &lt;password&gt;</code>\n\n"
+                    "Example: <code>/autologin user@email.com mysecretpassword</code>\n\n"
+                    "<i>Launches the server's automated browser sandbox worker to log in and extract session cookies automatically.</i>",
+                    parse_mode="HTML",
+                )
+                return
+
+            username = args[0].strip()
+            password = " ".join(args[1:]).strip()
+
+            status_msg = await update.message.reply_text(
+                f"⏳ <b>Launching Server Browser Sandbox Worker...</b>\n"
+                f"👤 <b>Account:</b> <code>{username[:4]}***</code>\n"
+                f"🔄 <i>Navigating to TeraBox & verifying session...</i>",
+                parse_mode="HTML",
+            )
+
+            res = login_with_browser_sandbox(username, password)
+
+            if res.get("success") and res.get("cookies"):
+                updated_vars = save_auth_cookies(res["cookies"])
+                ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
+                await status_msg.edit_text(
+                    f"🎉 <b>Browser Session Auto-Login Successful!</b>\n\n"
+                    f"⚙️ <b>Engine Used:</b> {res.get('method')}\n"
+                    f"🍪 <b>Parameters Saved:</b> <code>{', '.join(updated_vars)}</code>\n"
+                    f"🔑 <b>ndus Preview:</b> <code>{mask_sensitive(ndus, 4)}</code>\n\n"
+                    f"<i>All session parameters have been saved to database and persisted.</i>",
+                    parse_mode="HTML",
+                )
+            else:
+                err_msg = res.get("error", "Automated login failed")
+                await status_msg.edit_text(
+                    f"❌ <b>Auto-Login Failed</b>\n\n"
+                    f"<code>{err_msg}</code>\n\n"
+                    f"💡 Try updating via <code>/setcookie</code> or paste raw cookie string on Web Dashboard.",
+                    parse_mode="HTML",
+                )
 
         # ─── /admin Command (Multi-step Authentication) ───
 
@@ -991,8 +1406,10 @@ def run_telegram_bot():
 
         async def handle_admin_steps(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """Handle multi-step admin authentication via text messages."""
+            if not update.message or not update.effective_user or context.user_data is None:
+                return
             user_id = update.effective_user.id
-            text = update.message.text.strip()
+            text = (update.message.text or "").strip()
 
             if "admin_step" not in context.user_data:
                 return  # Not in admin auth flow — ignore
@@ -1449,6 +1866,8 @@ def run_telegram_bot():
 
         async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query = update.callback_query
+            if not query or not query.from_user or query.data is None:
+                return
             await query.answer()  # Acknowledge the button press
 
             user_id = query.from_user.id
@@ -1520,9 +1939,7 @@ def run_telegram_bot():
                             if res.get("status") == "confirmed":
                                 ndus = res.get("ndus", "")
                                 if ndus:
-                                    os.environ["TERABOX_NDUS_COOKIE"] = ndus
-                                    update_cookie(ndus)
-                                    save_ndus_to_db(ndus)
+                                    save_auth_cookies(ndus)
                                     add_log(f"QR Login successful for chat_id={chat_id}")
                                     try:
                                         import urllib.request
@@ -1849,72 +2266,263 @@ def run_telegram_bot():
                 parse_mode="HTML",
             )
 
-        # ─── Direct File Upload Handler ───
+        # ─── /urlmode & /stopurlmode Commands ───
 
-        async def handle_direct_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            """Handle direct document/file uploads sent to the Telegram bot."""
+        async def urlmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            args = context.args
+            arg0 = args[0].lower() if args else ""
+
+            if arg0 in ["off", "stop", "disable", "cancel", "false", "0"]:
+                set_url_only_mode(False)
+                await update.message.reply_text(
+                    "⏹ <b>URL Only Mode Deactivated!</b>\n\n"
+                    "Standard processing restored:\n"
+                    "• Both attached media files and TeraBox links will be processed.\n",
+                    parse_mode="HTML"
+                )
+                return
+
+            if arg0 in ["status", "check"]:
+                active, time_left = get_url_only_mode_status()
+                if active:
+                    m = int(time_left // 60)
+                    s = int(time_left % 60)
+                    exp_time = datetime.fromtimestamp(url_only_mode_state["expires_at"], tz=timezone.utc).strftime("%H:%M:%S UTC")
+                    await update.message.reply_text(
+                        f"🌐 <b>URL Only Mode: Active</b>\n\n"
+                        f"⏱ <b>Time Remaining:</b> {m}m {s}s\n"
+                        f"⌛ <b>Auto-Expires At:</b> {exp_time}\n\n"
+                        f"<i>Use <code>/stopurlmode</code> to deactivate.</i>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        "🌐 <b>URL Only Mode: Inactive</b>\n\n"
+                        "<i>Use <code>/urlmode</code> to activate for 60 minutes.</i>",
+                        parse_mode="HTML"
+                    )
+                return
+
+            # Activate URL mode for 60 minutes
+            duration_mins = 60
+            set_url_only_mode(True, duration_mins * 60)
+            now_dt = datetime.now(timezone.utc)
+            exp_dt = datetime.fromtimestamp(url_only_mode_state["expires_at"], tz=timezone.utc)
+
+            act_str = now_dt.strftime("%H:%M:%S UTC")
+            exp_str = exp_dt.strftime("%H:%M:%S UTC")
+
+            await update.message.reply_text(
+                f"🌐 <b>URL Only Mode Activated!</b>\n\n"
+                f"⏱ <b>Duration:</b> {duration_mins} Minutes (1 Hour)\n"
+                f"🕒 <b>Start Time:</b> <code>{act_str}</code>\n"
+                f"⌛ <b>Auto-Expires At:</b> <code>{exp_str}</code> (in 60m 00s)\n\n"
+                f"ℹ️ <b>Active Behavior:</b>\n"
+                f"• Messages containing files, images, or links will only have their <b>URLs extracted and processed</b>.\n"
+                f"• Attached media files/images will be <b>ignored & stripped</b>.\n"
+                f"• TeraBox URLs will be kept intact without truncation.\n\n"
+                f"<i>Use <code>/stopurlmode</code> to stop early.</i>",
+                parse_mode="HTML"
+            )
+
+        async def stopurlmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            set_url_only_mode(False)
+            await update.message.reply_text(
+                "⏹ <b>URL Only Mode Deactivated!</b>\n\n"
+                "Standard processing restored:\n"
+                "• Attached media (files, images, videos) will be uploaded.\n"
+                "• Links in messages & captions will be saved.",
+                parse_mode="HTML"
+            )
+
+        # ─── URL Extractor Helper ───
+
+        def extract_urls_from_message(msg) -> list:
+            """Extract all URLs from message text or caption, including Telegram entities."""
+            urls = []
+            text = msg.text or msg.caption or ""
+            entities = msg.entities or msg.caption_entities or []
+
+            # 1. Telegram entities (most accurate for formatted text_links)
+            for entity in entities:
+                if entity.type == "url":
+                    u = text[entity.offset : entity.offset + entity.length].strip()
+                    if u and u not in urls:
+                        urls.append(u)
+                elif entity.type == "text_link" and entity.url:
+                    u = entity.url.strip()
+                    if u and u not in urls:
+                        urls.append(u)
+
+            # 2. Regex fallback
+            import re
+            pattern = r'https?://[^\s<>"]+'
+            for match in re.findall(pattern, text):
+                cleaned = match.strip()
+                while cleaned and cleaned[-1] in ('.', ',', ')', ']', '!', ';', '>'):
+                    if '(' in cleaned and cleaned[-1] == ')':
+                        break
+                    cleaned = cleaned[:-1]
+                if cleaned and cleaned not in urls:
+                    urls.append(cleaned)
+
+            return urls
+
+        # ─── Unified Message Handler (Handles Decomposed Text, URLs & Media) ───
+
+        async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            message = update.message
+            if not message:
+                return
+
+            # Skip if in admin auth flow
+            if "admin_step" in context.user_data:
+                await handle_admin_steps(update, context)
+                return
+
             ndus = os.getenv("TERABOX_NDUS_COOKIE", "")
             if not ndus:
                 await update.message.reply_text("❌ No cookie configured. Use /setcookie to set one first.")
                 return
 
-            message = update.message
-            document = message.document or message.video or message.audio or message.voice
-            file_obj = None
-            file_name = "uploaded_file"
+            # Check URL Only Mode status
+            url_mode_active, time_left = get_url_only_mode_status()
 
+            # Extract URLs from message text or caption
+            all_extracted_urls = extract_urls_from_message(message)
+
+            terabox_keywords = [
+                "terabox", "1024tera", "4funbox", "mirrobox",
+                "nephobox", "momitbox", "freeterabox", "dubox", "surl="
+            ]
+            terabox_urls = [u for u in all_extracted_urls if any(kw in u.lower() for kw in terabox_keywords)]
+            generic_urls = [u for u in all_extracted_urls if u not in terabox_urls]
+
+            # Detect attached media
+            media_obj = None
+            file_name = "uploaded_file"
             if message.document:
-                file_obj = message.document
+                media_obj = message.document
                 file_name = message.document.file_name or "document"
             elif message.video:
-                file_obj = message.video
+                media_obj = message.video
                 file_name = f"video_{message.video.file_unique_id}.mp4"
             elif message.audio:
-                file_obj = message.audio
+                media_obj = message.audio
                 file_name = message.audio.file_name or f"audio_{message.audio.file_unique_id}.mp3"
             elif message.photo:
-                file_obj = message.photo[-1]
-                file_name = f"photo_{file_obj.file_unique_id}.jpg"
+                media_obj = message.photo[-1]
+                file_name = f"photo_{media_obj.file_unique_id}.jpg"
             elif message.voice:
-                file_obj = message.voice
-                file_name = f"voice_{file_obj.file_unique_id}.ogg"
+                media_obj = message.voice
+                file_name = f"voice_{media_obj.file_unique_id}.ogg"
 
-            if not file_obj:
-                return
+            # ─── A. URL ONLY MODE ACTIVE ───
+            if url_mode_active:
+                if terabox_urls:
+                    for url in terabox_urls:
+                        from terabox_helper import transfer_to_terabox
+                        status_msg = await update.message.reply_text(
+                            f"⏳ <b>Processing TeraBox Link (URL Only Mode)...</b>\n"
+                            f"🔗 <code>{url}</code>\n"
+                            f"📂 <b>Target Folder:</b> <code>{current_target_folder}</code>\n"
+                            f"🔄 <i>Contacting TeraBox servers...</i>",
+                            parse_mode="HTML",
+                        )
+                        result = transfer_to_terabox(url, current_target_folder)
+                        add_log(f"Transfer (URL Mode): {url[:40]}... → {'Success' if result['success'] else 'Failed'}")
+                        try:
+                            from database import log_transfer
+                            status_str = "success" if result["success"] else "failed"
+                            log_transfer(url, status_str, result["message"])
+                        except Exception as e:
+                            logger.error(f"Failed to log transfer: {e}")
+                        await status_msg.edit_text(result["message"], parse_mode="HTML")
 
-            status_msg = await update.message.reply_text(
-                f"⏳ <b>Downloading file from Telegram...</b>\n"
-                f"📄 <b>File Name:</b> <code>{file_name}</code>\n"
-                f"📂 <b>Target Folder:</b> <code>{current_target_folder}</code>",
-                parse_mode="HTML",
-            )
+                elif generic_urls:
+                    await update.message.reply_text(
+                        "⚠️ <b>Link Not Recognized</b>\n\n"
+                        "Please send a valid TeraBox share link, e.g.:\n"
+                        "<code>https://terabox.app/sharing/link?surl=...</code> or\n"
+                        "<code>https://1024terabox.com/s/1...</code>",
+                        parse_mode="HTML",
+                    )
+                elif media_obj:
+                    mins_rem = int(time_left // 60)
+                    secs_rem = int(time_left % 60)
+                    await update.message.reply_text(
+                        f"🌐 <b>URL Only Mode Active</b> ({mins_rem}m {secs_rem}s remaining)\n\n"
+                        f"ℹ️ Attached media (<code>{file_name}</code>) was ignored because URL Only Mode is ON.\n"
+                        f"No valid TeraBox URLs were found in the message text or caption.\n\n"
+                        f"<i>Use <code>/stopurlmode</code> to restore file uploads.</i>",
+                        parse_mode="HTML",
+                    )
 
-            try:
-                temp_dir = os.path.join(os.getcwd(), "scratch", "temp_uploads")
-                os.makedirs(temp_dir, exist_ok=True)
-                temp_path = os.path.join(temp_dir, file_name)
+            # ─── B. DEFAULT MODE (PROCESS BOTH URLS AND MEDIA) ───
+            else:
+                # 1. Process TeraBox URLs
+                if terabox_urls:
+                    for url in terabox_urls:
+                        from terabox_helper import transfer_to_terabox
+                        status_msg = await update.message.reply_text(
+                            f"⏳ <b>Processing TeraBox Link...</b>\n"
+                            f"🔗 <code>{url}</code>\n"
+                            f"📂 <b>Target Folder:</b> <code>{current_target_folder}</code>\n"
+                            f"🔄 <i>Contacting TeraBox servers...</i>",
+                            parse_mode="HTML",
+                        )
+                        result = transfer_to_terabox(url, current_target_folder)
+                        add_log(f"Transfer: {url[:40]}... → {'Success' if result['success'] else 'Failed'}")
+                        try:
+                            from database import log_transfer
+                            status_str = "success" if result["success"] else "failed"
+                            log_transfer(url, status_str, result["message"])
+                        except Exception as e:
+                            logger.error(f"Failed to log transfer: {e}")
+                        await status_msg.edit_text(result["message"], parse_mode="HTML")
 
-                tg_file = await context.bot.get_file(file_obj.file_id)
-                await tg_file.download_to_drive(custom_path=temp_path)
+                elif generic_urls and not media_obj:
+                    await update.message.reply_text(
+                        "⚠️ <b>Link Not Recognized</b>\n\n"
+                        "Please send a valid TeraBox share link, e.g.:\n"
+                        "<code>https://terabox.app/sharing/link?surl=...</code> or\n"
+                        "<code>https://1024terabox.com/s/1...</code>",
+                        parse_mode="HTML",
+                    )
 
-                await status_msg.edit_text(
-                    f"🔄 <b>Uploading to TeraBox...</b>\n"
-                    f"📄 <b>File Name:</b> <code>{file_name}</code>\n"
-                    f"📂 <b>Target Folder:</b> <code>{current_target_folder}</code>",
-                    parse_mode="HTML",
-                )
+                # 2. Process Attached Media
+                if media_obj:
+                    status_msg = await update.message.reply_text(
+                        f"⏳ <b>Downloading file from Telegram...</b>\n"
+                        f"📄 <b>File Name:</b> <code>{file_name}</code>\n"
+                        f"📂 <b>Target Folder:</b> <code>{current_target_folder}</code>",
+                        parse_mode="HTML",
+                    )
+                    try:
+                        temp_dir = os.path.join(os.getcwd(), "scratch", "temp_uploads")
+                        os.makedirs(temp_dir, exist_ok=True)
+                        temp_path = os.path.join(temp_dir, file_name)
 
-                result = upload_file_to_terabox(temp_path, current_target_folder)
+                        tg_file = await context.bot.get_file(media_obj.file_id)
+                        await tg_file.download_to_drive(custom_path=temp_path)
 
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                        await status_msg.edit_text(
+                            f"🔄 <b>Uploading to TeraBox...</b>\n"
+                            f"📄 <b>File Name:</b> <code>{file_name}</code>\n"
+                            f"📂 <b>Target Folder:</b> <code>{current_target_folder}</code>",
+                            parse_mode="HTML",
+                        )
 
-                add_log(f"Direct Upload: {file_name} → {'Success' if result['success'] else 'Failed'}")
-                await status_msg.edit_text(result["message"], parse_mode="HTML")
+                        result = upload_file_to_terabox(temp_path, current_target_folder)
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
 
-            except Exception as e:
-                logger.error(f"Direct file upload error: {e}")
-                await status_msg.edit_text(f"❌ Upload error: {str(e)}")
+                        add_log(f"Direct Upload: {file_name} → {'Success' if result['success'] else 'Failed'}")
+                        await status_msg.edit_text(result["message"], parse_mode="HTML")
+
+                    except Exception as e:
+                        logger.error(f"Direct file upload error: {e}")
+                        await status_msg.edit_text(f"❌ Upload error: {str(e)}")
 
         # ─── Register All Handlers ───
 
@@ -1927,8 +2535,11 @@ def run_telegram_bot():
         app_bot.add_handler(CommandHandler("folders", folders_cmd))
         app_bot.add_handler(CommandHandler("setfolder", setfolder_cmd))
         app_bot.add_handler(CommandHandler("setcookie", setcookie_cmd))
+        app_bot.add_handler(CommandHandler("autologin", autologin_cmd))
         app_bot.add_handler(CommandHandler("login", login_cmd))
         app_bot.add_handler(CommandHandler("upload", upload_cmd))
+        app_bot.add_handler(CommandHandler("urlmode", urlmode_cmd))
+        app_bot.add_handler(CommandHandler("stopurlmode", stopurlmode_cmd))
         app_bot.add_handler(CommandHandler("admin", admin_cmd))
 
         # Admin-only commands
@@ -1946,16 +2557,13 @@ def run_telegram_bot():
         # Callback query handler (inline keyboard buttons)
         app_bot.add_handler(CallbackQueryHandler(handle_callbacks))
 
-        # Text message handler (TeraBox links + admin auth flow)
-        app_bot.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_terabox_link)
-        )
-
-        # File upload message handler (direct files sent to bot)
+        # Unified message handler for all incoming text & media messages
         app_bot.add_handler(
             MessageHandler(
-                filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
-                handle_direct_file_upload
+                ~filters.COMMAND & (
+                    filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE
+                ),
+                handle_incoming_message
             )
         )
 
@@ -1972,6 +2580,9 @@ def run_telegram_bot():
 
 def run_startup_diagnostics():
     """Run startup checks and log results."""
+    # Restore authentication cookies from persistent database/settings storage
+    load_saved_auth_cookies()
+
     logger.info("="*60)
     logger.info("🚀 TeraBox Manager — Startup Diagnostics")
     logger.info("="*60)
@@ -2044,6 +2655,9 @@ def run_startup_diagnostics():
 
 # Run diagnostics before starting anything
 run_startup_diagnostics()
+
+# Start background cookie health monitoring thread
+threading.Thread(target=run_cookie_health_checker, daemon=True).start()
 
 if TELEGRAM_TOKEN:
     threading.Thread(target=run_telegram_bot, daemon=True).start()

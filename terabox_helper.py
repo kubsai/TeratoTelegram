@@ -6,6 +6,9 @@ import re
 import json
 import hashlib
 import urllib.parse
+import html as html_mod
+import importlib
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -185,7 +188,7 @@ def _sync_scraper_cookies(domain: str):
         logger.debug(f"Cookie jar sync warning: {e}")
 
 
-def get_headers(domain: str = None):
+def get_headers(domain: Optional[str] = None):
     """Build request headers. Cookie is always built fresh from env vars."""
     base_url = domain or TERABOX_BASE_URL
     cookie_str = _build_cookie_string()
@@ -200,15 +203,17 @@ def get_headers(domain: str = None):
     }
 
 
-def get_upload_headers(domain: str = None):
-    """Build headers for file upload requests. No Content-Type or Origin (let requests set multipart boundary)."""
-    base_url = domain or TERABOX_BASE_URL
+def get_upload_headers(domain: Optional[str] = None):
+    """Build headers for file upload requests.
+    No Content-Type (let requests set multipart boundary).
+    No Referer/Origin — AList doesn't set these for PCS uploads and
+    cross-domain Referer causes 'user not exists' on PCS servers.
+    """
     cookie_str = _build_cookie_string()
 
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Cookie": cookie_str,
-        "Referer": base_url + "/",
         "Accept": "application/json, text/plain, */*",
     }
 
@@ -301,7 +306,7 @@ def _make_api_params(jstoken: str = "") -> dict:
     return params
 
 
-def transfer_to_terabox(share_url: str, target_folder: str = None) -> dict:
+def transfer_to_terabox(share_url: str, target_folder: Optional[str] = None) -> dict:
     """Transfer a TeraBox share link to user's account.
     
     Architecture:
@@ -371,7 +376,7 @@ def transfer_to_terabox(share_url: str, target_folder: str = None) -> dict:
             debug_info.append(f"auth-check {domain}: {str(e)[:50]}")
 
     if not working_domain:
-        debug_str = "\n".join(f"• {d}" for d in debug_info)
+        debug_str = html_mod.escape("\n".join(f"• {d}" for d in debug_info))
         return {
             "success": False,
             "message": (
@@ -503,12 +508,12 @@ def transfer_to_terabox(share_url: str, target_folder: str = None) -> dict:
                 last_error = str(e)
 
     # All attempts failed
-    debug_str = "\n".join(f"• {d}" for d in debug_info[-8:])
+    debug_str = html_mod.escape("\n".join(f"• {d}" for d in debug_info[-8:]))
     return {
         "success": False,
         "message": (
             f"❌ <b>Transfer failed on all attempts.</b>\n\n"
-            f"<b>Last error:</b> {last_error}\n\n"
+            f"<b>Last error:</b> {html_mod.escape(last_error)}\n\n"
             f"<b>Debug log:</b>\n<code>{debug_str}</code>\n\n"
             f"💡 Try updating your cookie via /setcookie"
         )
@@ -520,14 +525,20 @@ def list_terabox_folders(ndus: str, path: str = "/") -> dict:
     if not ndus:
         return {"success": False, "error": "No ndus cookie provided"}
 
-    encoded_path = urllib.parse.quote(path, safe="/")
+    # Ensure path starts with /
+    if not path:
+        path = "/"
+    elif not path.startswith("/"):
+        path = "/" + path
+
     unique_domains = list(dict.fromkeys(TERABOX_DOMAINS))
+    last_errno = None
 
     for domain in unique_domains:
         _sync_scraper_cookies(domain)
         jstoken = get_jstoken(domain)
         params = _make_api_params(jstoken)
-        params["dir"] = encoded_path
+        params["dir"] = path
         params["order"] = "time"
         params["desc"] = "1"
         params["num"] = "100"
@@ -541,10 +552,20 @@ def list_terabox_folders(ndus: str, path: str = "/") -> dict:
                 data = response.json()
             except Exception:
                 continue
-            if data.get("errno") == 0:
+
+            errno = data.get("errno")
+            last_errno = errno
+
+            if errno == 0:
                 return {"success": True, "list": data.get("list", []), "path": path, "domain": domain}
+            elif errno in [-2, 2, 31066]:
+                return {"success": False, "error": f"Folder <code>{path}</code> does not exist in your TeraBox account."}
+
         except Exception as e:
             logger.warning(f"Folder list error on {domain}: {e}")
+
+    if last_errno in [-2, 2, 31066]:
+        return {"success": False, "error": f"Folder <code>{path}</code> does not exist in your TeraBox account."}
 
     return {"success": False, "error": "Cookie invalid or expired. Update via /setcookie."}
 
@@ -593,6 +614,8 @@ def check_terabox_connectivity(ndus: str) -> dict:
 
 def get_qr_login_data() -> dict:
     passport_urls = [
+        "https://passport.terabox.app/v2/api/qrcode/get",
+        "https://www.terabox.app/api/qrcode/get",
         "https://passport.terabox.com/v2/api/qrcode/get",
         "https://passport.1024terabox.com/v2/api/qrcode/get",
     ]
@@ -611,11 +634,13 @@ def get_qr_login_data() -> dict:
                     continue
         except Exception as e:
             logger.error(f"QR get error on {url}: {e}")
-    return {"success": False, "error": "QR login unsupported. Use /setcookie."}
+    return {"success": False, "error": "QR login unsupported. Use /setcookie or /autologin."}
 
 
 def poll_qr_login(sign: str) -> dict:
     passport_urls = [
+        "https://passport.terabox.app/v2/api/qrcode/poll",
+        "https://www.terabox.app/api/qrcode/poll",
         "https://passport.terabox.com/v2/api/qrcode/poll",
         "https://passport.1024terabox.com/v2/api/qrcode/poll",
     ]
@@ -644,6 +669,141 @@ def poll_qr_login(sign: str) -> dict:
     return {"status": "error", "error": "Polling failed."}
 
 
+# ===================== BROWSER SANDBOX & CREDENTIAL LOGIN WORKER =====================
+
+def login_with_browser_sandbox(username: str, password: str) -> dict:
+    """
+    Automated Browser Sandbox & Passport Login Worker:
+    Attempts to log in to TeraBox using username and password via:
+      Stage 1: Playwright Headless Browser Sandbox (if available)
+      Stage 2: Selenium Headless Browser Sandbox (if available)
+      Stage 3: Passport API Direct Session POST (built-in fallback engine)
+
+    Extracts all authentication cookies: ndus, browserid, csrfToken, ndut_fmt, ndut_fmv, lang.
+    """
+    logger.info(f"Starting Browser Sandbox / Credentials Login for user: {username[:4]}***")
+
+    # Stage 1: Playwright Headless Browser
+    try:
+        playwright_sync = importlib.import_module("playwright.sync_api")
+        sync_playwright = playwright_sync.sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            page.goto("https://www.terabox.app/main", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            user_input = page.query_selector('input[name="username"], input[type="text"], input[type="email"]')
+            pass_input = page.query_selector('input[name="password"], input[type="password"]')
+
+            if user_input and pass_input:
+                user_input.fill(username)
+                pass_input.fill(password)
+                btn = page.query_selector('button[type="submit"], .login-btn, input[type="submit"]')
+                if btn:
+                    btn.click()
+                    page.wait_for_timeout(5000)
+
+            cookies_list = context.cookies()
+            browser.close()
+
+            cookie_dict = {c['name']: c['value'] for c in cookies_list}
+            if "ndus" in cookie_dict:
+                logger.info("Playwright sandbox login successful!")
+                return {"success": True, "cookies": cookie_dict, "method": "Playwright Headless Browser"}
+    except Exception as e:
+        logger.warning(f"Playwright sandbox login unavailable/failed: {e}")
+
+    # Stage 2: Selenium Headless Browser
+    try:
+        selenium_driver = importlib.import_module("selenium.webdriver")
+        chrome_opts = importlib.import_module("selenium.webdriver.chrome.options")
+        webdriver = selenium_driver
+        Options = chrome_opts.Options
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+
+        driver = webdriver.Chrome(options=options)
+        driver.get("https://www.terabox.app/main")
+        time.sleep(3)
+
+        try:
+            user_input = driver.find_element("name", "username")
+            pass_input = driver.find_element("name", "password")
+            if user_input and pass_input:
+                user_input.send_keys(username)
+                pass_input.send_keys(password)
+                pass_input.submit()
+                time.sleep(5)
+        except Exception:
+            pass
+
+        raw_cookies = driver.get_cookies()
+        driver.quit()
+
+        cookie_dict = {c['name']: c['value'] for c in raw_cookies}
+        if "ndus" in cookie_dict:
+            logger.info("Selenium sandbox login successful!")
+            return {"success": True, "cookies": cookie_dict, "method": "Selenium Headless Browser"}
+    except Exception as e:
+        logger.warning(f"Selenium sandbox login unavailable/failed: {e}")
+
+    # Stage 3: Passport API Direct Session POST (Built-in Fallback)
+    passport_domains = [
+        "https://passport.terabox.app",
+        "https://passport.terabox.com",
+        "https://passport.1024terabox.com"
+    ]
+
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    import requests
+    req_sess = requests.Session()
+
+    for base_domain in passport_domains:
+        try:
+            # 1. Get initial token
+            t_url = f"{base_domain}/v2/api/getapi"
+            params = {"tpl": "netdisk", "apiver": "v3", "clienttype": "0", "app_id": "250528"}
+            req_sess.get(t_url, params=params, headers=hdrs, timeout=8)
+
+            # 2. Login POST
+            l_url = f"{base_domain}/v2/api/login"
+            payload = {
+                "username": username,
+                "password": password,
+                "tpl": "netdisk",
+                "apiver": "v3",
+                "clienttype": "0",
+                "app_id": "250528",
+                "isphone": "0" if "@" in username else "1"
+            }
+            resp = req_sess.post(l_url, data=payload, headers=hdrs, timeout=12)
+            c_dict = req_sess.cookies.get_dict()
+            if "ndus" in c_dict:
+                logger.info(f"Passport API login successful on {base_domain}!")
+                return {"success": True, "cookies": c_dict, "method": f"Passport API ({base_domain})"}
+
+        except Exception as e:
+            logger.warning(f"Passport API login error on {base_domain}: {e}")
+
+    return {
+        "success": False,
+        "error": "Automated login failed across all browser sandbox & API engines. Please verify credentials or check if TeraBox requires SMS/CAPTCHA verification for your account."
+    }
+
+
 # ===================== DIRECT FILE UPLOAD HELPER =====================
 
 def get_file_md5(file_path: str) -> str:
@@ -654,7 +814,7 @@ def get_file_md5(file_path: str) -> str:
     return hash_md5.hexdigest()
 
 
-def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
+def upload_file_to_terabox(file_path: str, target_folder: Optional[str] = None) -> dict:
     """Upload a local file to TeraBox via PCS upload API.
     
     Architecture:
@@ -721,7 +881,7 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
             debug_info.append(f"auth-check {domain}: {str(e)[:50]}")
 
     if not working_domain:
-        debug_str = "\n".join(f"• {d}" for d in debug_info)
+        debug_str = html_mod.escape("\n".join(f"• {d}" for d in debug_info))
         return {
             "success": False,
             "message": (
@@ -799,7 +959,7 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
             "success": False,
             "message": (
                 f"❌ <b>Precreate rejected (errno={p_errno}).</b>\n"
-                f"<code>{json.dumps(p_data)[:200]}</code>\n\n"
+                f"<code>{html_mod.escape(json.dumps(p_data)[:200])}</code>\n\n"
                 f"💡 Update cookie via /setcookie"
             )
         }
@@ -866,7 +1026,7 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
             logger.warning(f"superfile2 {pcs_dom}: {err}")
 
     if not u_resp or u_resp.status_code not in [200, 201]:
-        sf_str = "\n".join(f"• {s}" for s in sf_debug)
+        sf_str = html_mod.escape("\n".join(f"• {s}" for s in sf_debug))
         return {
             "success": False,
             "message": (
@@ -920,7 +1080,7 @@ def upload_file_to_terabox(file_path: str, target_folder: str = None) -> dict:
             "success": False,
             "message": (
                 f"❌ <b>Create (commit) rejected: errno={c_errno}</b>\n"
-                f"<code>{json.dumps(c_data)[:200]}</code>\n\n"
+                f"<code>{html_mod.escape(json.dumps(c_data)[:200])}</code>\n\n"
                 f"💡 Update cookie via /setcookie"
             )
         }
