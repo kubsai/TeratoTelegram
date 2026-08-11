@@ -8,6 +8,8 @@ import hashlib
 import urllib.parse
 import html as html_mod
 import importlib
+import sys
+import subprocess
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -681,41 +683,148 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
 
     Extracts all authentication cookies: ndus, browserid, csrfToken, ndut_fmt, ndut_fmv, lang.
     """
-    logger.info(f"Starting Browser Sandbox / Credentials Login for user: {username[:4]}***")
+    logger.info(f"=== Starting Browser Sandbox / Credentials Login for user: {username[:4]}*** ===")
+    stage_diagnostics = []
 
     # Stage 1: Playwright Headless Browser
     try:
         playwright_sync = importlib.import_module("playwright.sync_api")
         sync_playwright = playwright_sync.sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+
+        def _run_pw(p_instance):
+            import shutil
+            exec_path = shutil.which("chromium") or shutil.which("chromium-browser")
+            launch_kwargs = {'headless': True, 'args': ['--no-sandbox', '--disable-setuid-sandbox']}
+            if exec_path:
+                browser = p_instance.chromium.launch(executable_path=exec_path, **launch_kwargs)
+            else:
+                browser = p_instance.chromium.launch(**launch_kwargs)
+
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
             )
             page = context.new_page()
-            page.goto("https://www.terabox.app/main", timeout=30000)
-            page.wait_for_timeout(2000)
 
-            user_input = page.query_selector('input[name="username"], input[type="text"], input[type="email"]')
-            pass_input = page.query_selector('input[name="password"], input[type="password"]')
+            login_urls = [
+                "https://www.1024terabox.com/login",
+                "https://www.1024terabox.com/wap",
+                "https://www.terabox.com/login",
+                "https://www.terabox.app/login",
+                "https://www.terabox.app/main",
+            ]
 
-            if user_input and pass_input:
-                user_input.fill(username)
-                pass_input.fill(password)
-                btn = page.query_selector('button[type="submit"], .login-btn, input[type="submit"]')
-                if btn:
-                    btn.click()
-                    page.wait_for_timeout(5000)
+            cookie_dict = {}
 
-            cookies_list = context.cookies()
+            for url in login_urls:
+                try:
+                    logger.info(f"=== [Playwright Step 1/5] Navigating to: {url} ===")
+                    resp = page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(2500)
+                    status_code = resp.status if resp else "unknown"
+                    final_url = page.url
+                    if final_url != url:
+                        logger.info(f"   ↪ Redirected to: {final_url}")
+                    logger.info(f"=== [Playwright Step 2/5] Page Loaded (Status: {status_code}, Final URL: '{final_url}', Title: '{page.title()}', Frames: {len(page.frames)}) ===")
+
+                    def find_el(selectors):
+                        for sel in selectors:
+                            try:
+                                el = page.query_selector(sel)
+                                if el and el.is_visible():
+                                    return el, "main_page", sel
+                            except Exception:
+                                pass
+                            for idx, frame in enumerate(page.frames):
+                                try:
+                                    el = frame.query_selector(sel)
+                                    if el and el.is_visible():
+                                        return el, f"frame_{idx}", sel
+                                except Exception:
+                                    pass
+                        return None, None, None
+
+                    # Check if login trigger button/tab needs to be clicked
+                    tab_selectors = ['.login-tab-item', '.js-login-type', 'text="Email"', 'text="Account"', '.login-btn-email', '.js-login-btn']
+                    tab_btn, f_name, t_sel = find_el(tab_selectors)
+                    if tab_btn:
+                        try:
+                            logger.info(f"=== [Playwright Step 3/5] Clicked login trigger button in {f_name} ({t_sel}) ===")
+                            tab_btn.click()
+                            page.wait_for_timeout(1000)
+                        except Exception as e:
+                            logger.warning(f"Failed clicking login trigger button: {e}")
+                    else:
+                        logger.info("=== [Playwright Step 3/5] No trigger button needed — checking fields directly ===")
+
+                    user_selectors = [
+                        'input[name="username"]', 'input[name="userName"]', 'input[name="email"]',
+                        'input[type="email"]', 'input[type="text"]', 'input[placeholder*="email" i]',
+                        'input[placeholder*="account" i]', 'input[placeholder*="phone" i]'
+                    ]
+                    pass_selectors = [
+                        'input[name="password"]', 'input[type="password"]', 'input[placeholder*="password" i]'
+                    ]
+
+                    user_input, u_frame, u_sel = find_el(user_selectors)
+                    pass_input, p_frame, p_sel = find_el(pass_selectors)
+
+                    if user_input and pass_input:
+                        logger.info(f"=== [Playwright Step 4/5] Found input fields: Username in {u_frame} ({u_sel}), Password in {p_frame} ({p_sel}) ===")
+                        user_input.fill(username)
+                        pass_input.fill(password)
+                        page.wait_for_timeout(500)
+
+                        btn_selectors = [
+                            'button[type="submit"]', '.login-btn', '.js-login-btn',
+                            'input[type="submit"]', 'button:has-text("Log in")', 'button:has-text("Login")'
+                        ]
+                        submit_btn, s_frame, s_sel = find_el(btn_selectors)
+                        if submit_btn:
+                            logger.info(f"=== [Playwright Step 5/5] Submitting form via button in {s_frame} ({s_sel})... ===")
+                            submit_btn.click()
+                        else:
+                            logger.info("=== [Playwright Step 5/5] Submitting form via Enter key... ===")
+                            pass_input.press("Enter")
+
+                        page.wait_for_timeout(6000)
+                    else:
+                        logger.warning(f"=== [Playwright Step 4/5] Could not find username/password inputs on {url} ===")
+
+                    cookies_list = context.cookies()
+                    cookie_dict = {c['name']: c['value'] for c in cookies_list}
+                    if "ndus" in cookie_dict:
+                        logger.info(f"🎉 === [Playwright Step 5/5] SUCCESS: Captured ndus cookie on {url}! ===")
+                        break
+                    else:
+                        logger.info(f"=== [Playwright Step 5/5] ndus missing on {url}. Captured cookies: {list(cookie_dict.keys())} ===")
+
+                except Exception as page_err:
+                    logger.warning(f"Playwright error on {url}: {page_err}")
+
             browser.close()
+            return cookie_dict
 
-            cookie_dict = {c['name']: c['value'] for c in cookies_list}
-            if "ndus" in cookie_dict:
-                logger.info("Playwright sandbox login successful!")
-                return {"success": True, "cookies": cookie_dict, "method": "Playwright Headless Browser"}
+        try:
+            with sync_playwright() as p:
+                cookie_dict = _run_pw(p)
+        except Exception as pw_err:
+            if "playwright install" in str(pw_err).lower() or "executable doesn't exist" in str(pw_err).lower():
+                logger.info("Playwright chromium browser missing. Auto-installing chromium binaries...")
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+                with sync_playwright() as p:
+                    cookie_dict = _run_pw(p)
+            else:
+                raise pw_err
+
+        if "ndus" in cookie_dict:
+            logger.info("Playwright sandbox login successful!")
+            return {"success": True, "cookies": cookie_dict, "method": "Playwright Headless Browser"}
+        else:
+            stage_diagnostics.append("Playwright: Checked URLs but ndus cookie was not generated (form submission or CAPTCHA required).")
     except Exception as e:
         logger.warning(f"Playwright sandbox login unavailable/failed: {e}")
+        stage_diagnostics.append(f"Playwright: {e}")
 
     # Stage 2: Selenium Headless Browser
     try:
@@ -730,7 +839,7 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
         options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
 
         driver = webdriver.Chrome(options=options)
-        driver.get("https://www.terabox.app/main")
+        driver.get("https://www.1024terabox.com/login")
         time.sleep(3)
 
         try:
@@ -751,19 +860,21 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
         if "ndus" in cookie_dict:
             logger.info("Selenium sandbox login successful!")
             return {"success": True, "cookies": cookie_dict, "method": "Selenium Headless Browser"}
+        else:
+            stage_diagnostics.append("Selenium: Loaded page but ndus cookie was not set.")
     except Exception as e:
         logger.warning(f"Selenium sandbox login unavailable/failed: {e}")
+        stage_diagnostics.append(f"Selenium: {e}")
 
     # Stage 3: Passport API Direct Session POST (Built-in Fallback)
+    logger.info("=== [Passport API Step 1/3] Initiating direct HTTP session POST login... ===")
     passport_targets = [
+        ("https://www.1024terabox.com", "/v2/api"),
+        ("https://dm.1024terabox.com", "/v2/api"),
         ("https://www.terabox.app", "/v2/api"),
         ("https://dm.terabox.app", "/v2/api"),
         ("https://passport.terabox.com", "/v2/api"),
         ("https://www.terabox.com", "/v2/api"),
-        ("https://www.terabox.app", "/passport/v2/api"),
-        ("https://dm.terabox.app", "/passport/v2/api"),
-        ("https://www.1024terabox.com", "/v2/api"),
-        ("https://dm.1024terabox.com", "/v2/api"),
     ]
 
     hdrs = {
@@ -778,6 +889,7 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
 
     for base_domain, api_prefix in passport_targets:
         try:
+            logger.info(f"=== [Passport API Step 2/3] Trying endpoint: {base_domain}{api_prefix}/login ===")
             # 1. Get initial token
             t_url = f"{base_domain}{api_prefix}/getapi"
             params = {"tpl": "netdisk", "apiver": "v3", "clienttype": "0", "app_id": "250528"}
@@ -796,16 +908,37 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
             }
             resp = req_sess.post(l_url, data=payload, headers=hdrs, timeout=12)
             c_dict = req_sess.cookies.get_dict()
+            for k, v in resp.cookies.get_dict().items():
+                c_dict[k] = v
+
+            logger.info(f"   --> {base_domain} Status: {resp.status_code}, Snippet: {resp.text[:100]}")
+
             if "ndus" in c_dict:
-                logger.info(f"Passport API login successful on {base_domain}!")
+                logger.info(f"🎉 === [Passport API Step 3/3] SUCCESS on {base_domain}! ===")
                 return {"success": True, "cookies": c_dict, "method": f"Passport API ({base_domain})"}
+
+            if resp.status_code == 200:
+                try:
+                    rdata = resp.json()
+                    res_ndus = rdata.get("data", {}).get("ndus") or rdata.get("ndus")
+                    if res_ndus:
+                        c_dict["ndus"] = res_ndus
+                        return {"success": True, "cookies": c_dict, "method": f"Passport API ({base_domain})"}
+
+                    errno = rdata.get("errno") or rdata.get("error_code")
+                    errmsg = rdata.get("errmsg") or rdata.get("error_msg")
+                    if errno:
+                        stage_diagnostics.append(f"Passport API ({base_domain}): errno={errno} ({errmsg or 'Security verification or wrong credentials'})")
+                except Exception:
+                    pass
 
         except Exception as e:
             logger.warning(f"Passport API login error on {base_domain}{api_prefix}: {e}")
 
+    diag_text = "<br>".join(f"• {d}" for d in stage_diagnostics[-4:])
     return {
         "success": False,
-        "error": "Automated login failed across all browser sandbox & API engines. Please verify credentials or check if TeraBox requires SMS/CAPTCHA verification for your account."
+        "error": f"Automated login failed across all engines.<br><br><b>Detailed Engine Diagnostics:</b><br>{diag_text}<br><br>💡 <i>Note: TeraBox requires Google/OAuth or SMS/CAPTCHA for direct logins. Use <b>/setcookie</b> to paste your browser cookie string.</i>"
     }
 
 
