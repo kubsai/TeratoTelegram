@@ -755,10 +755,15 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
         logger.warning(f"Selenium sandbox login unavailable/failed: {e}")
 
     # Stage 3: Passport API Direct Session POST (Built-in Fallback)
-    passport_domains = [
-        "https://passport.terabox.app",
-        "https://passport.terabox.com",
-        "https://passport.1024terabox.com"
+    passport_targets = [
+        ("https://www.terabox.app", "/v2/api"),
+        ("https://dm.terabox.app", "/v2/api"),
+        ("https://passport.terabox.com", "/v2/api"),
+        ("https://www.terabox.com", "/v2/api"),
+        ("https://www.terabox.app", "/passport/v2/api"),
+        ("https://dm.terabox.app", "/passport/v2/api"),
+        ("https://www.1024terabox.com", "/v2/api"),
+        ("https://dm.1024terabox.com", "/v2/api"),
     ]
 
     hdrs = {
@@ -771,15 +776,15 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
     import requests
     req_sess = requests.Session()
 
-    for base_domain in passport_domains:
+    for base_domain, api_prefix in passport_targets:
         try:
             # 1. Get initial token
-            t_url = f"{base_domain}/v2/api/getapi"
+            t_url = f"{base_domain}{api_prefix}/getapi"
             params = {"tpl": "netdisk", "apiver": "v3", "clienttype": "0", "app_id": "250528"}
             req_sess.get(t_url, params=params, headers=hdrs, timeout=8)
 
             # 2. Login POST
-            l_url = f"{base_domain}/v2/api/login"
+            l_url = f"{base_domain}{api_prefix}/login"
             payload = {
                 "username": username,
                 "password": password,
@@ -796,7 +801,7 @@ def login_with_browser_sandbox(username: str, password: str) -> dict:
                 return {"success": True, "cookies": c_dict, "method": f"Passport API ({base_domain})"}
 
         except Exception as e:
-            logger.warning(f"Passport API login error on {base_domain}: {e}")
+            logger.warning(f"Passport API login error on {base_domain}{api_prefix}: {e}")
 
     return {
         "success": False,
